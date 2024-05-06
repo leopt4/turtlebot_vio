@@ -1,0 +1,25 @@
+{
+  "configurations": [
+    {
+      "browse": {
+        "databaseFilename": "${default}",
+        "limitSymbolsToIncludedHeaders": false
+      },
+      "includePath": [
+        "/home/patweatharva/ros_work/turtlebot_class/devel/include/**",
+        "/opt/ros/noetic/include/**",
+        "/home/patweatharva/ros_work/turtlebot_class/src/stonefish_ros/include/**",
+        "/home/patweatharva/ros_work/test_turtlebot/src/turtlebot3_simulations/turtlebot3_fake/include/**",
+        "/home/patweatharva/ros_work/test_turtlebot/src/turtlebot3_simulations/turtlebot3_gazebo/include/**",
+        "/home/patweatharva/ros_work/turtlebot_class/src/turtlebot_graph_slam/include/**",
+        "/usr/include/**"
+      ],
+      "name": "ROS",
+      "intelliSenseMode": "gcc-x64",
+      "compilerPath": "/usr/bin/gcc",
+      "cStandard": "gnu11",
+      "cppStandard": "c++14"
+    }
+  ],
+  "version": 4
+}
