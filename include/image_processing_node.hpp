@@ -12,7 +12,8 @@
 #include <sensor_msgs/image_encodings.h> // Include for sensor_msgs
 #include <cv_bridge/cv_bridge.h>
 #include <opencv2/flann.hpp>
-
+#include "opencv2/highgui.hpp"
+#include "opencv2/core.hpp"
 #include <iostream>
 #include <vector>
 #include <deque>
@@ -28,6 +29,9 @@ struct imageData
     std::vector<cv::KeyPoint> keypoints;
     cv::Mat descriptors;
     std::map<int, std::vector<cv::DMatch>> matchingMap;
+
+    // Following field is stored solely for debug purpose (Kindly remove while actual implementataion)
+    cv::Mat img;
 };
 
 class imgBuffer
@@ -99,19 +103,22 @@ public:
 
     imgBuffer buffer_;
 
+    std::string directory_; // Directory for saving the images (while debugging)
+
     Ptr<cv::FeatureDetector> detector_;  // Feature detector
     Ptr<cv::DescriptorMatcher> matcher_; // Descriptor matcher
 
     int current_frame_ID = -1;
 
     imageHandler(ros::NodeHandle &nh, double thresholdTime, double thresholdOdometry)
-        : nh_(nh), thresholdTime_(thresholdTime), thresholdOdometry_(thresholdOdometry), buffer_(5)
+        : nh_(nh), thresholdTime_(thresholdTime), thresholdOdometry_(thresholdOdometry), buffer_(5), directory_("/home/patweatharva/ros_work/turtlebot_class/src/turtlebot_vio/opencv_tests")
     {
-        imu_preint_ = nh.subscribe("/turtlebot/kobuki/odom", 1, &imageHandler::imuCallback, this);
-        img_in_ = nh.subscribe("image topic", 1, &imageHandler::imgCallback, this);
+        imu_preint_ = nh.subscribe("/odom", 1, &imageHandler::imuCallback, this);
+        img_in_ = nh.subscribe("/turtlebot/kobuki/realsense/color/image_color", 1, &imageHandler::imgCallback, this);
 
         // Initialize feature detector and matcher
-        matcher_ = DescriptorMatcher::create(DescriptorMatcher::FLANNBASED);
+        detector_ = cv::ORB::create();
+        matcher_ = cv::FlannBasedMatcher::create();
 
         // Timer for getting a new frame
         timer_ = nh.createTimer(ros::Duration(thresholdTime_), &imageHandler::timerCallback, this);
@@ -135,9 +142,6 @@ private:
     void ransac();
     void updateKeypointClassID();
     void publish2DFeatureMap();
-
-    std::vector<cv::KeyPoint> all_good_features_; // Store all good features
-    std::vector<cv::Point2f> image_points_;       // Store 2D image points
 };
 
 void imageHandler::imgCallback(const sensor_msgs::ImageConstPtr &msg)
@@ -157,11 +161,20 @@ void imageHandler::imgCallback(const sensor_msgs::ImageConstPtr &msg)
         };
 
         cv::Mat img = cv_ptr->image;
+
+        std::string originalImagePath = directory_ + "/original_" + std::to_string(current_frame_ID) + ".png";
+        cv::imwrite(originalImagePath, img);
+
         imagePreprocessing(img);
 
+        std::string processedImagePath = directory_ + "/processed_" + std::to_string(current_frame_ID) + ".png";
+        cv::imwrite(processedImagePath, img);
+
+        ROS_INFO("-------Frame (ID- %d) Captured and Processed Successfully-------", current_frame_ID);
+
         std::map<int, std::vector<cv::DMatch>> matchingMap = detectAndMatchFeatures(img);
-        ransac();
-        publish2DFeatureMap();
+        // ransac();
+        // publish2DFeatureMap();
 
         // Reset triggers for next frame
         // ODOM_TRIGGER = false;
@@ -186,59 +199,117 @@ void imageHandler::imagePreprocessing(cv::Mat &img)
 
 std::map<int, std::vector<cv::DMatch>> imageHandler::detectAndMatchFeatures(cv::Mat &img)
 {
+    // for Lowe's Ratio test
+    const float ratio_thresh = 0.7f;
+
     // Detect features in the current frame
     std::vector<cv::KeyPoint> keypoints;
     cv::Mat descriptors;
     detector_->detectAndCompute(img, cv::noArray(), keypoints, descriptors);
 
+    // Convert descriptors to CV_32F format if necessary
+    if (descriptors.type() != CV_32F)
+    {
+        descriptors.convertTo(descriptors, CV_32F);
+    }
+
+    std::cout << "Features and Descriptors Computed" << std::endl;
+
     // Initialize a map to store matched features and their IDs
     std::map<int, std::vector<cv::DMatch>> matchedFeatures;
+
+    std::cout << "Map for matched feature created" << std::endl;
 
     // Check if there is only one frame in the buffer
     if (current_frame_ID == 0)
     {
         // Handle the case where there is only one frame available
         // This might involve special processing or simply storing the current frame
-        // For now, let's assume we just store the current frame without matching
         imageData newFrameInfo = {
             0,
             keypoints,
             descriptors,
             matchedFeatures,
-        };
+            img};
         buffer_.push(newFrameInfo);
+        std::cout << "First frame with empty map added to the buffer" << std::endl;
         return matchedFeatures; // Return empty map since there's no matching to do
     }
+    else
+    {
 
-    // Iterate over each frame in the buffer
+        // Iterate over each frame in the buffer
+        for (int i = 0; i < buffer_.getNumberofMembers(); ++i)
+        {
+            imageData frameData = buffer_.get(buffer_.getNumberofMembers()-1-i);
+
+            // Match descriptors between the current frame and the frame in the buffer
+            std::vector<std::vector<cv::DMatch>> knn_matches;
+            matcher_->knnMatch(descriptors, frameData.descriptors, knn_matches, 2);
+
+            if (knn_matches.empty())
+            {
+                // Handling the case where no matches are found
+                std::cout << "No matches found between Frame ID-: " << current_frame_ID << " and " << frameData.frameID << std::endl;
+                continue; // Skip the current iteration
+            }
+            else
+            {
+                std::cout << "Matches found between frame ID" << current_frame_ID << " and " << frameData.frameID << std::endl;
+                // Apply Lowe's ratio test
+                std::vector<cv::DMatch> good_matches;
+                for (size_t j = 0; j < knn_matches.size(); j++)
+                {
+                    if (knn_matches[j][0].distance < ratio_thresh * knn_matches[j][1].distance)
+                    {
+                        good_matches.push_back(knn_matches[j][0]);
+                    }
+                }
+
+                std::cout << "Lowe's ratio applied" << std::endl;
+                std::cout << "Size of good_matches" << good_matches.size() << std::endl;
+                // Store the good matches and their corresponding frame ID
+                if (!good_matches.empty())
+                {
+                    std::cout << "Good Matches stored for the Frame ID" << current_frame_ID << " and " << frameData.frameID << std::endl;
+                    matchedFeatures.insert(std::make_pair(frameData.frameID,good_matches));
+                    // matchedFeatures[frameData.frameID] = good_matches;
+                    std::cout << "Good Matches Stored in the map" << std::endl;
+                }
+                else
+                {
+                    continue;
+                }
+            }
+        }
+    }
+
+    std::cout << "Matching Done for Frame ID - " << current_frame_ID << std::endl;
+
+    // Following block is solely for debug purpose (Kindly remove while actual implementataion)
     for (int i = 0; i < buffer_.getNumberofMembers(); ++i)
     {
         imageData frameData = buffer_.get(i);
 
-        // Match descriptors between the current frame and the frame in the buffer
-        std::vector<std::vector<cv::DMatch>> knn_matches;
-        matcher_->knnMatch(descriptors, frameData.descriptors, knn_matches, 2);
+        // Assuming img is the current frame image and frameData.descriptors is the descriptor of the frame in the buffer
+        std::vector<cv::DMatch> matches = matchedFeatures[frameData.frameID];
 
-        // Apply Lowe's ratio test
-        std::vector<cv::DMatch> good_matches;
-        for (size_t j = 0; j < knn_matches.size(); j++)
-        {
-            if (knn_matches[j][0].distance < 0.7 * knn_matches[j][1].distance)
-            {
-                good_matches.push_back(knn_matches[j][0]);
-            }
-        }
+        // Draw matches
+        cv::Mat img_matches;
+        cv::drawMatches(img, keypoints, frameData.img, frameData.keypoints, matches, img_matches);
 
-        // Store the good matches and their corresponding frame ID
-        if (!good_matches.empty())
-        {
-            matchedFeatures[frameData.frameID] = good_matches;
-        }
+        // Save the visualized matches
+        std::string visualizationPath = directory_ + "/matches_" + std::to_string(current_frame_ID) + "_" + std::to_string(frameData.frameID) + ".png";
+        cv::imwrite(visualizationPath, img_matches);
     }
 
+    std::cout << "Matching visualisation done for Frame ID - " << current_frame_ID << std::endl;
+
     // Store the current frame information
-    imageData newFrameInfo = {current_frame_ID, keypoints, descriptors, matchedFeatures};
+    imageData newFrameInfo = {current_frame_ID, keypoints, descriptors, matchedFeatures, img};
     buffer_.push(newFrameInfo);
+
+    std::cout << "New Frame stored in the Buffer - " << current_frame_ID << std::endl;
 
     return matchedFeatures;
 }
