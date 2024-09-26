@@ -1,23 +1,31 @@
 graphVIO:
   gravity: 9.80998592
-  Use_ISAM2: true
 
   camera:
     pixelSigma: 1.0
-    fx: 50.0
-    fy: 50.0
+    fx: 1396.80866
+    fy: 1396.80866
     s: 0.0
-    u0: 50
-    v0: 50
+    u0: 960.0
+    v0: 540.0
 
   ISAM2:
+    Use_ISAM2: true 
     params:
       relinearizeThreshold: 0.01
       relinearizeSkip: 1
       factorization: "CHOLESKY"
 
   LevenbergMarquardt:
-    setVerbosityLM: "SUMMARY"
+    params:
+      initialLambda: 0.00001
+      lambdaFactor: 5.0
+      lambdaUpperBound: 100000
+      lambdaLowerBound: 0.00001
+      minModelFidelity: 0.001
+      useDiagonalDamping: true
+      diagonalDamping: 0.001
+      useLevenbergMarquardt: true
 
   IMU:
     accel_noise_sigma: 0.0003924

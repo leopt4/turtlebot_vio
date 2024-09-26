@@ -2,6 +2,8 @@
 #define GRAPH_VIO_HANDLER_H
 
 #include "ros/ros.h"
+#include <ros/package.h>
+
 #include "turtlebot_vio/Keypoint2DArray.h"
 #include "sensor_msgs/Imu.h"
 #include "nav_msgs/Odometry.h"
@@ -14,8 +16,10 @@
 #include <gtsam/base/Value.h>
 #include <gtsam/inference/Symbol.h>
 #include <gtsam/nonlinear/ISAM2.h>
+#include <gtsam/nonlinear/ISAM2Params.h>
 
 #include <gtsam/nonlinear/LevenbergMarquardtOptimizer.h>
+#include <gtsam/nonlinear/LevenbergMarquardtParams.h>
 #include <gtsam/nonlinear/NonlinearFactorGraph.h>
 #include <gtsam/nonlinear/Values.h>
 
@@ -31,9 +35,11 @@
 #include <gtsam/slam/SmartProjectionPoseFactor.h>
 
 #include <vector>
-#include <cstring>
-#include <fstream>
 #include <iostream>
+#include <string>
+#include <memory>
+#include <exception>
+#include <stdexcept>
 
 using namespace std;
 using namespace gtsam;
@@ -47,14 +53,16 @@ typedef SmartProjectionPoseFactor<Cal3_S2> sppf;
 class graph_vio_handler
 {
 private:
-    NonlinearFactorGraph *graph_;
+    std::unique_ptr<NonlinearFactorGraph> graph_;
+    std::unique_ptr<ISAM2> isam2_;
 
-    ISAM2 *isam2_;
+    ISAM2Params isam2params_;
+    LevenbergMarquardtParams optimizerParams_;
 
     nav_msgs::Odometry initialOdom_;
 
     Values initial_estimates_;
-    Vector6 initial_sigmas_;
+    Eigen::Matrix<double, 6, 6> prior_noise_model_;
 
     Values results_;
 
@@ -79,16 +87,25 @@ private:
     std::map<size_t, sppf::shared_ptr> smartFactors_;
     SmartProjectionParams sppfparams_; // TODO: Tuning (double triangulation threshold)
 
+    vector<Point2> lastKeypoints_;
+
 protected:
     ros::NodeHandle nh_;
     ros::Subscriber feature2D_sub_, imu_sub_, odom_sub_;
 
 public:
+    bool saveGraph_ = false;
+
     double gravity_;
     bool isam2InUse_;
 
-    int index_ = 0;
+    bool graph_initialised_ = false;
+    bool optimizer_initialised_ = false;
+
+    bool initialSmartFactorsAdded_ = false;
     bool added_initialValues_ = false;
+
+    int index_ = 0;
     ros::Time lastIMUStamp_;
 
     graph_vio_handler(ros::NodeHandle &nh);
@@ -96,7 +113,7 @@ public:
 
     void readGravity();
     void initGraph();
-    void initISAM2();
+    void initOptimizer();
     void addInitialValuestoGraph(const Pose3 &prior_pose, const Vector3 &prior_vel);
     void getImuParams();
     void readCameraParams();
@@ -116,7 +133,7 @@ graph_vio_handler::graph_vio_handler(ros::NodeHandle &nh) : nh_(nh), graph_(null
     SmartProjectionParams sppfParams_(LinearizationMode linMode = HESSIAN, DegeneracyMode degMode = ZERO_ON_DEGENERACY);
     readGravity();
     initGraph();
-    initISAM2();
+    initOptimizer();
     readCameraParams();
     getImuParams();
     initpreintegrated();
@@ -137,12 +154,17 @@ void graph_vio_handler::readGravity()
 
 void graph_vio_handler::initGraph()
 {
-    graph_ = new NonlinearFactorGraph();
+    if (graph_ == nullptr)
+    {
+        graph_ = std::make_unique<NonlinearFactorGraph>();
+        ROS_INFO_STREAM("Nonlinear Factor Graph Initialized!!");
+        graph_initialised_ = true;
+    }
 }
 
-void graph_vio_handler::initISAM2()
+void graph_vio_handler::initOptimizer()
 {
-    if (nh_.getParam("/graphVIO/Use_ISAM2", isam2InUse_))
+    if (nh_.getParam("/graphVIO/ISAM2/Use_ISAM2", isam2InUse_))
     {
         if (isam2InUse_)
         {
@@ -184,21 +206,72 @@ void graph_vio_handler::initISAM2()
             }
 
             // Initialize ISAM2 with fetched parameters
-            ISAM2Params isam2Params;
-            isam2Params.relinearizeThreshold = relinearizeThreshold;
-            isam2Params.relinearizeSkip = relinearizeSkip;
-            isam2Params.factorization = factorization;
+            isam2params_.factorization = factorization;
+            isam2params_.relinearizeSkip = relinearizeSkip;
+            isam2params_.setRelinearizeThreshold(relinearizeThreshold);
 
             // Create ISAM2 instance
-            isam2_ = new ISAM2(isam2Params);
-
-            ROS_INFO("ISAM2 initialized with parameters: relinearizeThreshold: %f, relinearizeSkip: %d, factorization: %s",
-                     relinearizeThreshold, relinearizeSkip, factorizationStr.c_str());
+            isam2_ = std::make_unique<ISAM2>(isam2params_);
+            ROS_INFO_STREAM("ISAM2 Optimizer initialized with parameters!!!!");
         }
         else
         {
             ROS_INFO("ISAM2 Not Initialized!! Using LevenbergMarquardt Optimizer!!");
+
+            // Read LevenbergMarquardt parameters
+            double initialLambda, lambdaFactor, lambdaUpperBound, lambdaLowerBound, minModelFidelity, diagonalDamping;
+            bool useDiagonalDamping, useLevenbergMarquardt;
+
+            if (!nh_.getParam("/graphVIO/LevenbergMarquardt/params/initialLambda", initialLambda))
+            {
+                ROS_ERROR("Failed to get LevenbergMarquardt initialLambda parameter");
+                return;
+            }
+            if (!nh_.getParam("/graphVIO/LevenbergMarquardt/params/lambdaFactor", lambdaFactor))
+            {
+                ROS_ERROR("Failed to get LevenbergMarquardt lambdaFactor parameter");
+                return;
+            }
+            if (!nh_.getParam("/graphVIO/LevenbergMarquardt/params/lambdaUpperBound", lambdaUpperBound))
+            {
+                ROS_ERROR("Failed to get LevenbergMarquardt lambdaUpperBound parameter");
+                return;
+            }
+            if (!nh_.getParam("/graphVIO/LevenbergMarquardt/params/lambdaLowerBound", lambdaLowerBound))
+            {
+                ROS_ERROR("Failed to get LevenbergMarquardt lambdaLowerBound parameter");
+                return;
+            }
+            if (!nh_.getParam("/graphVIO/LevenbergMarquardt/params/minModelFidelity", minModelFidelity))
+            {
+                ROS_ERROR("Failed to get LevenbergMarquardt minModelFidelity parameter");
+                return;
+            }
+            if (!nh_.getParam("/graphVIO/LevenbergMarquardt/params/useDiagonalDamping", useDiagonalDamping))
+            {
+                ROS_ERROR("Failed to get LevenbergMarquardt useDiagonalDamping parameter");
+                return;
+            }
+            if (!nh_.getParam("/graphVIO/LevenbergMarquardt/params/diagonalDamping", diagonalDamping))
+            {
+                ROS_ERROR("Failed to get LevenbergMarquardt diagonalDamping parameter");
+                return;
+            }
+            if (!nh_.getParam("/graphVIO/LevenbergMarquardt/params/useLevenbergMarquardt", useLevenbergMarquardt))
+            {
+                ROS_ERROR("Failed to get LevenbergMarquardt useLevenbergMarquardt parameter");
+                return;
+            }
+
+            optimizerParams_.setlambdaInitial(initialLambda);        // TODO: Tuning
+            optimizerParams_.setlambdaFactor(lambdaFactor);          // TODO: Tuning
+            optimizerParams_.setlambdaUpperBound(lambdaUpperBound);  // TODO: Tuning
+            optimizerParams_.setlambdaLowerBound(lambdaLowerBound);  // TODO: Tuning
+            optimizerParams_.setDiagonalDamping(useDiagonalDamping); // TODO: Tuning
+
+            ROS_INFO_STREAM("LevenbergMarquardt Optimizer initialized with parameters!!");
         }
+        optimizer_initialised_ = true;
     }
     else
     {
@@ -218,14 +291,19 @@ void graph_vio_handler::odomCB(const nav_msgs::Odometry::ConstPtr &msg)
 
     Pose3 prior_pose(quat, Point3(x, y, 0.0));
 
-    double yaw_cov = initialOdom_.pose.covariance[35];
-    double x_cov = initialOdom_.pose.covariance[0];
-    double y_cov = initialOdom_.pose.covariance[7];
+    // prior_noise_model << initialOdom_.pose.covariance[0], initialOdom_.pose.covariance[1], initialOdom_.pose.covariance[2], initialOdom_.pose.covariance[3], initialOdom_.pose.covariance[4], initialOdom_.pose.covariance[5],
+    //                     initialOdom_.pose.covariance[6], initialOdom_.pose.covariance[7], initialOdom_.pose.covariance[8], initialOdom_.pose.covariance[9], initialOdom_.pose.covariance[10], initialOdom_.pose.covariance[11],
+    //                     initialOdom_.pose.covariance[12], initialOdom_.pose.covariance[13], initialOdom_.pose.covariance[14], initialOdom_.pose.covariance[15],initialOdom_.pose.covariance[16], initialOdom_.pose.covariance[17],
+    //                     initialOdom_.pose.covariance[18], initialOdom_.pose.covariance[19], initialOdom_.pose.covariance[20], initialOdom_.pose.covariance[21], initialOdom_.pose.covariance[22], initialOdom_.pose.covariance[23],
+    //                     initialOdom_.pose.covariance[24], initialOdom_.pose.covariance[25], initialOdom_.pose.covariance[26], initialOdom_.pose.covariance[27],initialOdom_.pose.covariance[28], initialOdom_.pose.covariance[29],
+    //                     initialOdom_.pose.covariance[30], initialOdom_.pose.covariance[31],initialOdom_.pose.covariance[32], initialOdom_.pose.covariance[33], initialOdom_.pose.covariance[34], initialOdom_.pose.covariance[35];
 
-
-    Eigen::VectorXd sigmas(6);
-    sigmas<<0.01, 0.01, yaw_cov, x_cov, y_cov, 0.001;
-    initial_sigmas_ << Vector6(sigmas); // TODO: Tuning
+    prior_noise_model_ << 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        0.0, 0.0, initialOdom_.pose.covariance[35], initialOdom_.pose.covariance[30], initialOdom_.pose.covariance[31], 0.0,
+        0.0, 0.0, initialOdom_.pose.covariance[5], initialOdom_.pose.covariance[0], initialOdom_.pose.covariance[1], 0.0,
+        0.0, 0.0, initialOdom_.pose.covariance[11], initialOdom_.pose.covariance[6], initialOdom_.pose.covariance[7], 0.0,
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0;
 
     Vector3 prior_vel(0.0, 0.0, 0.0); // Prior velocity
 
@@ -245,7 +323,7 @@ void graph_vio_handler::addInitialValuestoGraph(const Pose3 &prior_pose, const V
 {
 
     // Add initial noise models (Read Covariance from odom)
-    auto pose_noise_model = noiseModel::Diagonal::Sigmas(initial_sigmas_); // TODO: Tuning
+    auto pose_noise_model = noiseModel::Constrained::Covariance(prior_noise_model_); // TODO: Tuning
 
     auto gaussian_bias = noiseModel::Diagonal::Sigmas((Vector(6) << Vector3::Constant(5.0e-2), Vector3::Constant(5.0e-3)).finished()); // TODO: Tuning
     auto huber_bias = noiseModel::Robust::Create(noiseModel::mEstimator::Huber::Create(1.345), gaussian_bias);                         // TODO: Tuning
@@ -292,7 +370,7 @@ void graph_vio_handler::readCameraParams()
     ROS_INFO_STREAM("Camera parameters read successfully: fx=" << fx << ", fy=" << fy << ", cx=" << u0 << ", cy=" << v0 << ", skew=" << s);
 
     measurementNoise_ = noiseModel::Isotropic::Sigma(2, pixelSigma);
-    ROS_INFO_STREAM("HELLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLl");
+    ROS_INFO_STREAM("Measurement Noise model initialized with " << pixelSigma);
 
     // TODO: Reading camera pose in body (body_P_sensor_)
 }
@@ -313,7 +391,7 @@ void graph_vio_handler::getImuParams()
     else
     {
 
-        p_ = PreintegratedCombinedMeasurements::Params::MakeSharedD((gravity_));
+        p_ = PreintegratedCombinedMeasurements::Params::MakeSharedD();
         Matrix33 measured_acc_cov = I_3x3 * pow(accel_noise_sigma, 2);
         Matrix33 measured_omega_cov = I_3x3 * pow(gyro_noise_sigma, 2);
         Matrix33 integration_error_cov = I_3x3 * 1e-8; // TODO: Tuning
@@ -326,6 +404,7 @@ void graph_vio_handler::getImuParams()
         // iTb // Camera to IMU Translation
         // p->body_P_sensor = Pose3(iRb, iTb);
 
+        // p_->n_gravity = Vector3(0.0,0.0,gravity_);
         p_->accelerometerCovariance = measured_acc_cov;
         p_->integrationCovariance = integration_error_cov;
         p_->gyroscopeCovariance = measured_omega_cov;
@@ -357,15 +436,20 @@ void graph_vio_handler::imuCB(const sensor_msgs::Imu::ConstPtr &imu_msg)
         if (p_ != nullptr && graph_ != nullptr && preintegrated_ != nullptr && added_initialValues_)
         {
             double dt = ((imu_msg->header.stamp) - lastIMUStamp_).toSec();
-            preintegrated_->integrateMeasurement(Vector3(imu_msg->linear_acceleration.x, imu_msg->linear_acceleration.y, imu_msg->linear_acceleration.z),
+            // preintegrated_->integrateMeasurement(Vector3(imu_msg->linear_acceleration.x, imu_msg->linear_acceleration.y, imu_msg->linear_acceleration.z),
+            //                                      Vector3(imu_msg->angular_velocity.x, imu_msg->angular_velocity.y, imu_msg->angular_velocity.z),
+            //                                      dt);
+            preintegrated_->integrateMeasurement(Vector3(imu_msg->linear_acceleration.x, imu_msg->linear_acceleration.y, 0.0),
                                                  Vector3(imu_msg->angular_velocity.x, imu_msg->angular_velocity.y, imu_msg->angular_velocity.z),
                                                  dt); // Subtstracted Gravity
+
+            // ROS_INFO_STREAM("Integrating IMU measurements with dt"<< dt);
         }
         else
         {
             ROS_ERROR_STREAM("Some information missing!, can not do IMU preintegration!!");
         }
-        preintegrated_->print("Measurements:- ");
+        // preintegrated_->print("Measurements:- ");
     }
 
     lastIMUStamp_ = imu_msg->header.stamp;
@@ -376,42 +460,88 @@ void graph_vio_handler::featureCB(const turtlebot_vio::Keypoint2DArray::ConstPtr
     if ((feature_msg->keypoints).size() > 0)
     {
         stopIMUPreint_ = true;
-        index_++;
 
-        auto imu_preint = dynamic_cast<const PreintegratedCombinedMeasurements &>(*preintegrated_);
-        CombinedImuFactor imu_factor(X(index_ - 1), V(index_ - 1), X(index_), V(index_), B(index_ - 1), B(index_), imu_preint);
-
-        graph_->add(imu_factor);
-        imuBias::ConstantBias zero_bias(Vector3(0, 0, 0), Vector3(0, 0, 0)); // TODO: Tuning
-        graph_->add(BetweenFactor<imuBias::ConstantBias>(B(index_ - 1), B(index_), zero_bias, bias_noise_model_));
-
-        prop_state_ = preintegrated_->predict(prev_state_, prev_bias_);
-
-        initial_estimates_.insert(X(index_), prop_state_.pose());
-        initial_estimates_.insert(V(index_), prop_state_.v());
-        initial_estimates_.insert(B(index_), prev_bias_);
-
-        for (const auto &feature : feature_msg->keypoints)
+        if (initialSmartFactorsAdded_)
         {
-            int classID = feature.class_id;
-            if (smartFactors_.count(classID) == 0)
+
+            for (const auto &feature : feature_msg->keypoints)
             {
-                // If there's no SmartProjectionPoseFactor for this classID, create one
-                smartFactors_[classID] = sppf::shared_ptr(new sppf(measurementNoise_, K_, body_P_sensor_, sppfparams_));
-                graph_->add(smartFactors_[classID]);
+                int classID = feature.class_id;
+
+                if (smartFactors_.count(classID) == 0)
+                {
+                    smartFactors_[classID] = sppf::shared_ptr(new sppf(measurementNoise_, K_, body_P_sensor_, sppfparams_));
+                }
+
+                try
+                {
+                    // Attempt to add the feature to the SmartProjectionPoseFactor
+                    smartFactors_[classID]->add(Point2(feature.x, feature.y), X(index_));
+                    graph_->add(smartFactors_[classID]);
+                }
+                catch (const std::exception &e)
+                {
+                    ROS_ERROR_STREAM("Error adding feature to SmartProjectionPoseFactor: " << e.what());
+                    continue; // Skip the current iteration and move to the next feature
+                }
+            }
+            initialSmartFactorsAdded_ = true;
+            ROS_INFO_STREAM("Initial Smart Factors added to the Graph.");
+        }
+        else
+        {
+            index_++;
+            ROS_INFO_STREAM("Current Index: " << index_);
+
+            prop_state_ = preintegrated_->predict(prev_state_, prev_bias_);
+
+            initial_estimates_.insert(X(index_), prop_state_.pose());
+            initial_estimates_.insert(V(index_), prop_state_.v());
+            initial_estimates_.insert(B(index_), prev_bias_);
+
+            ROS_INFO_STREAM("POSE3 at index" << index_ << "is" << initial_estimates_.at<Pose3>(X(index_)););
+            ROS_INFO_STREAM("Velocity" << index_ << "is" << initial_estimates_.at<Vector3>(V(index_)););
+            // ROS_INFO_STREAM(initial_estimates_.at<Pose3>(X(index_)););
+
+            auto imu_preint = dynamic_cast<const PreintegratedCombinedMeasurements &>(*preintegrated_);
+            CombinedImuFactor imu_factor(X(index_ - 1), V(index_ - 1), X(index_), V(index_), B(index_ - 1), B(index_), imu_preint);
+
+            graph_->add(imu_factor);
+            imuBias::ConstantBias zero_bias(Vector3(0, 0, 0), Vector3(0, 0, 0)); // TODO: Tuning
+            graph_->add(BetweenFactor<imuBias::ConstantBias>(B(index_ - 1), B(index_), zero_bias, bias_noise_model_));
+
+            for (const auto &feature : feature_msg->keypoints)
+            {
+                int classID = feature.class_id;
+                if (smartFactors_.count(classID) == 0)
+                {
+                    // If there's no SmartProjectionPoseFactor for this classID, create one
+                    smartFactors_[classID] = sppf::shared_ptr(new sppf(measurementNoise_, K_, body_P_sensor_, sppfparams_));
+                    graph_->add(smartFactors_[classID]);
+                }
+                try
+                {
+                    // Attempt to add the feature to the SmartProjectionPoseFactor
+                    smartFactors_[classID]->add(Point2(feature.x, feature.y), X(index_));
+                }
+                catch (const std::exception &e)
+                {
+                    ROS_ERROR_STREAM("Error adding feature to SmartProjectionPoseFactor: " << e.what());
+                    continue; // Skip the current iteration and move to the next feature
+                }
+            }
+            if (index_ > 2)
+            {
+                solveAndResetGraph();
             }
 
-            smartFactors_[classID]->add(Point2(feature.x, feature.y), X(index_));
+            prev_state_ = NavState(results_.at<Pose3>(X(index_)), results_.at<Vector3>(V(index_)));
+
+            prev_bias_ = results_.at<imuBias::ConstantBias>(B(index_));
         }
 
-        solveAndResetGraph();
-
-        prev_state_ = NavState(results_.at<Pose3>(X(index_)), results_.at<Vector3>(V(index_)));
-
-        prev_bias_ = results_.at<imuBias::ConstantBias>(B(index_));
-
-        stopIMUPreint_ = false; // TODO: Change position of this trigger after graph update
         preintegrated_->resetIntegrationAndSetBias(prev_bias_);
+        stopIMUPreint_ = false; // TODO: Change position of this trigger after graph update
     }
     else
     {
@@ -421,21 +551,41 @@ void graph_vio_handler::featureCB(const turtlebot_vio::Keypoint2DArray::ConstPtr
 
 void graph_vio_handler::solveAndResetGraph()
 {
-    if (isam2InUse_)
+    try
     {
-        ROS_INFO_STREAM("Optimizing the graph using ISAM2!");
-        isam2_->update(*graph_, initial_estimates_);
-        results_ = isam2_->calculateEstimate();
+        if (isam2InUse_)
+        {
+            ROS_INFO_STREAM("Optimizing the graph using ISAM2!");
+            isam2_->update(*graph_, initial_estimates_);
+            results_ = isam2_->calculateEstimate();
+
+            graph_->resize(0);
+            initial_estimates_.clear();
+        }
+        else
+        {
+            ROS_INFO_STREAM("Optimizing the graph using Levenberg-Marquardt Optimizer!");
+
+            // Create LevenbergMarquardtOptimizer instance
+            LevenbergMarquardtOptimizer optimizer(*graph_, initial_estimates_, optimizerParams_);
+            results_ = optimizer.optimize();
+        }
     }
-    else
+    catch (const std::exception &e)
     {
-        ROS_INFO_STREAM("Optimizing the graph using Levenberg-Marquardt Optimizer!");
-        LevenbergMarquardtOptimizer optimizer(*graph_, initial_estimates_);
-        results_ = optimizer.optimize();
+        ROS_ERROR_STREAM("Error occurred while optimizing the graph: " << e.what());
+    }
+    catch (...)
+    {
+        ROS_ERROR_STREAM("Unknown error occurred while optimizing the graph.");
     }
 
-    graph_->resize(0);
-    initial_estimates_.clear();
+    if (saveGraph_)
+    {
+        std::string file_name = ros::package::getPath("turtlebot_vio") + "/graph_viz/factorGraphViz.dot";
+        ROS_INFO_STREAM("Graph viz file" << file_name);
+        graph_->saveGraph(file_name, results_);
+    }
 }
 
 #endif // GRAPH_VIO_HANDLER_H
