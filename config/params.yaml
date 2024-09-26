@@ -1,23 +1,27 @@
+graphVIO:
+  gravity: 9.80998592
+  Use_ISAM2: true
 
-# ISAM2 Solver Condition
-/graphVIO/Use_ISAM2: True
+  camera:
+    pixelSigma: 1.0
+    fx: 50.0
+    fy: 50.0
+    s: 0.0
+    u0: 50
+    v0: 50
 
-# ISAM2 Parameters
-ISAM2/params/relinearizeThreshold : 0.01
-ISAM2/params/relinearizeSkip : 1
-ISAM2/params/factorization: "CHOLESKY"
+  ISAM2:
+    params:
+      relinearizeThreshold: 0.01
+      relinearizeSkip: 1
+      factorization: "CHOLESKY"
 
+  LevenbergMarquardt:
+    setVerbosityLM: "SUMMARY"
 
-# IMU Parameters
-/IMU/accel_noise_sigma: 0.0003924
-/IMU/gyro_noise_sigma: 0.000205689024915
-/IMU/accel_bias_rw_sigma: 0.000205689024915
-/IMU/gyro_bias_rw_sigma: 0.000001454441043
-
-# Other
-/gravity: 9.80665
-
-
-
-
-
+  IMU:
+    accel_noise_sigma: 0.0003924
+    gyro_noise_sigma: 0.000205689024915
+    accel_bias_rw_sigma: 0.000205689024915
+    gyro_bias_rw_sigma: 0.000001454441043
+    

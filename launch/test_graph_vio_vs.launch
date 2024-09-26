@@ -1,0 +1,3 @@
+<launch>
+    <node pkg="turtlebot_vio" type="graph_vio_node" name="graph_vio_node"/>
+</launch>
