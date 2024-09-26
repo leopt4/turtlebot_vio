@@ -5,10 +5,10 @@
 #include <ros/package.h>
 
 #include "turtlebot_vio/Keypoint2DArray.h"
-#include "sensor_msgs/Imu.h"
 #include "nav_msgs/Odometry.h"
 #include <tf/transform_datatypes.h>
 #include <geometry_msgs/Quaternion.h>
+#include <visualization_msgs/MarkerArray.h>
 
 #include <Eigen/Dense>
 
@@ -27,12 +27,13 @@
 #include <gtsam/slam/dataset.h>
 #include <gtsam/slam/PriorFactor.h>
 
-#include <gtsam/navigation/ImuFactor.h>
-#include <gtsam/navigation/ImuBias.h>
-#include <gtsam/navigation/CombinedImuFactor.h>
-
 #include <gtsam/geometry/Cal3_S2.h>
 #include <gtsam/slam/SmartProjectionPoseFactor.h>
+
+// #include "turtlebot_graph_slam/ResetFilter.h"
+
+#include <geometry_msgs/Point.h>
+#include <geometry_msgs/Pose.h>
 
 #include <vector>
 #include <iostream>
@@ -44,8 +45,6 @@
 using namespace std;
 using namespace gtsam;
 
-using symbol_shorthand::B; // Bias  (ax,ay,az,gx,gy,gz)
-using symbol_shorthand::V; // Vel   (xdot,ydot,zdot)
 using symbol_shorthand::X; // Pose3 (r,p,y,x,y,z)
 
 typedef SmartProjectionPoseFactor<Cal3_S2> sppf;
@@ -60,43 +59,35 @@ private:
     LevenbergMarquardtParams optimizerParams_;
 
     nav_msgs::Odometry initialOdom_;
+    nav_msgs::Odometry currentOdom_;
 
     Values initial_estimates_;
+    Pose3 current_pose_;
     Eigen::Matrix<double, 6, 6> prior_noise_model_;
+    Eigen::Matrix<double, 6, 6> pose_noise_model_;
 
     Values results_;
-
-    noiseModel::Robust::shared_ptr velocity_noise_model_;
-    noiseModel::Robust::shared_ptr bias_noise_model_;
-    imuBias::ConstantBias prior_imu_bias_; // assuming zero initial bias
-
-    NavState prev_state_;
-    NavState prop_state_;
-    imuBias::ConstantBias prev_bias_;
 
     Cal3_S2::shared_ptr K_;
     noiseModel::Isotropic::shared_ptr measurementNoise_;
     std::optional<Pose3> body_P_sensor_; // TODO: Calibration (Camera pose in body)
 
-    std::shared_ptr<PreintegratedCombinedMeasurements::Params> p_;
-    std::shared_ptr<PreintegratedCombinedMeasurements> preintegrated_;
-
-    bool stopIMUPreint_ = false;
-
     // Smart Factor Map <landmark ID , Instance of Smart Factor>
     std::map<size_t, sppf::shared_ptr> smartFactors_;
     SmartProjectionParams sppfparams_; // TODO: Tuning (double triangulation threshold)
 
-    vector<Point2> lastKeypoints_;
-
 protected:
     ros::NodeHandle nh_;
-    ros::Subscriber feature2D_sub_, imu_sub_, odom_sub_;
+    ros::Subscriber feature2D_sub_, odom_sub_;
+    ros::Publisher odom_pub_ = nh_.advertise<nav_msgs::Odometry>("/VIOdometry", 10);
+    ros::Publisher point_pub_ = nh_.advertise<geometry_msgs::Point>("/3DPoints", 10);
+    ros::Publisher point_marker_pub_ = nh_.advertise<visualization_msgs::MarkerArray>("/3DPointsMarkers", 10);
+    ros::Timer timer_;
+
 
 public:
     bool saveGraph_ = false;
 
-    double gravity_;
     bool isam2InUse_;
 
     bool graph_initialised_ = false;
@@ -106,50 +97,44 @@ public:
     bool added_initialValues_ = false;
 
     int index_ = 0;
-    ros::Time lastIMUStamp_;
+
+    bool stopOdom_ = false;
+
+    // ros::ServiceClient client_;
 
     graph_vio_handler(ros::NodeHandle &nh);
     ~graph_vio_handler();
 
-    void readGravity();
     void initGraph();
     void initOptimizer();
-    void addInitialValuestoGraph(const Pose3 &prior_pose, const Vector3 &prior_vel);
-    void getImuParams();
+    void addInitialValuestoGraph();
     void readCameraParams();
-    void initpreintegrated();
-    void imuCB(const sensor_msgs::Imu::ConstPtr &imu_msg);
     void featureCB(const turtlebot_vio::Keypoint2DArray::ConstPtr &feature_msg);
     void odomCB(const nav_msgs::Odometry::ConstPtr &msg);
     void solveAndResetGraph();
+    // void resetOdom();
+    void publishOdom();
+    void publishFeatures(const ros::TimerEvent &);
 };
 
-graph_vio_handler::graph_vio_handler(ros::NodeHandle &nh) : nh_(nh), graph_(nullptr), isam2_(nullptr), preintegrated_(nullptr), p_(nullptr), K_(nullptr), measurementNoise_(nullptr), lastIMUStamp_(ros::Time(0))
+graph_vio_handler::graph_vio_handler(ros::NodeHandle &nh) : nh_(nh), graph_(nullptr), isam2_(nullptr), K_(nullptr), measurementNoise_(nullptr) //, client_(nh.serviceClient<turtlebot_graph_slam::ResetFilter>("ResetFilter"))
 {
     feature2D_sub_ = nh.subscribe("/feature2D", 10, &graph_vio_handler::featureCB, this);
-    imu_sub_ = nh.subscribe("/turtlebot/kobuki/sensors/imu_data", 100, &graph_vio_handler::imuCB, this);
     odom_sub_ = nh.subscribe("/odom", 1, &graph_vio_handler::odomCB, this);
 
+
     SmartProjectionParams sppfParams_(LinearizationMode linMode = HESSIAN, DegeneracyMode degMode = ZERO_ON_DEGENERACY);
-    readGravity();
     initGraph();
     initOptimizer();
     readCameraParams();
-    getImuParams();
-    initpreintegrated();
+
+
+    timer_ = nh_.createTimer(ros::Duration(0.1), &graph_vio_handler::publishFeatures, this);
 }
 
 graph_vio_handler::~graph_vio_handler()
 {
     return;
-}
-
-void graph_vio_handler::readGravity()
-{
-    if (nh_.getParam("/graphVIO/gravity", gravity_))
-    {
-        ROS_INFO_STREAM("Gravity Read!!");
-    }
 }
 
 void graph_vio_handler::initGraph()
@@ -161,6 +146,21 @@ void graph_vio_handler::initGraph()
         graph_initialised_ = true;
     }
 }
+
+// void graph_vio_handler::resetOdom()
+// {
+//     turtlebot_graph_slam::ResetFilter srv;
+//     srv.request.reset_filter_requested = true;
+
+//     if (client_.call(srv))
+//     {
+//         ROS_INFO("Odometry Filter (EKF) is succesfully reset.... : %d", (bool)srv.response.reset_filter_response);
+//     }
+//     else
+//     {
+//         ROS_ERROR("Failed to call reset Odometry Filter!!!!!!!");
+//     };
+// }
 
 void graph_vio_handler::initOptimizer()
 {
@@ -281,71 +281,49 @@ void graph_vio_handler::initOptimizer()
 
 void graph_vio_handler::odomCB(const nav_msgs::Odometry::ConstPtr &msg)
 {
-    initialOdom_ = *msg;
+    if (!stopOdom_)
+    {
+        currentOdom_ = *msg;
 
-    // // Extract position and orientation from the odometry message
-    double x = initialOdom_.pose.pose.position.x;
-    double y = initialOdom_.pose.pose.position.y;
+        // // Extract position and orientation from the odometry message
+        double x = currentOdom_.pose.pose.position.x;
+        double y = currentOdom_.pose.pose.position.y;
 
-    Rot3 quat = Rot3::Quaternion(initialOdom_.pose.pose.orientation.w, initialOdom_.pose.pose.orientation.x, initialOdom_.pose.pose.orientation.y, initialOdom_.pose.pose.orientation.z);
+        Rot3 quat = Rot3::Quaternion(currentOdom_.pose.pose.orientation.w, currentOdom_.pose.pose.orientation.x, currentOdom_.pose.pose.orientation.y, currentOdom_.pose.pose.orientation.z);
 
-    Pose3 prior_pose(quat, Point3(x, y, 0.0));
+        current_pose_ = Pose3(quat, Point3(x, y, 0.0));
 
-    // prior_noise_model << initialOdom_.pose.covariance[0], initialOdom_.pose.covariance[1], initialOdom_.pose.covariance[2], initialOdom_.pose.covariance[3], initialOdom_.pose.covariance[4], initialOdom_.pose.covariance[5],
-    //                     initialOdom_.pose.covariance[6], initialOdom_.pose.covariance[7], initialOdom_.pose.covariance[8], initialOdom_.pose.covariance[9], initialOdom_.pose.covariance[10], initialOdom_.pose.covariance[11],
-    //                     initialOdom_.pose.covariance[12], initialOdom_.pose.covariance[13], initialOdom_.pose.covariance[14], initialOdom_.pose.covariance[15],initialOdom_.pose.covariance[16], initialOdom_.pose.covariance[17],
-    //                     initialOdom_.pose.covariance[18], initialOdom_.pose.covariance[19], initialOdom_.pose.covariance[20], initialOdom_.pose.covariance[21], initialOdom_.pose.covariance[22], initialOdom_.pose.covariance[23],
-    //                     initialOdom_.pose.covariance[24], initialOdom_.pose.covariance[25], initialOdom_.pose.covariance[26], initialOdom_.pose.covariance[27],initialOdom_.pose.covariance[28], initialOdom_.pose.covariance[29],
-    //                     initialOdom_.pose.covariance[30], initialOdom_.pose.covariance[31],initialOdom_.pose.covariance[32], initialOdom_.pose.covariance[33], initialOdom_.pose.covariance[34], initialOdom_.pose.covariance[35];
+        pose_noise_model_ << 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, currentOdom_.pose.covariance[35], currentOdom_.pose.covariance[30], currentOdom_.pose.covariance[31], 0.0,
+            0.0, 0.0, currentOdom_.pose.covariance[5], currentOdom_.pose.covariance[0], currentOdom_.pose.covariance[1], 0.0,
+            0.0, 0.0, currentOdom_.pose.covariance[11], currentOdom_.pose.covariance[6], currentOdom_.pose.covariance[7], 0.0,
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0;
 
-    prior_noise_model_ << 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-        0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-        0.0, 0.0, initialOdom_.pose.covariance[35], initialOdom_.pose.covariance[30], initialOdom_.pose.covariance[31], 0.0,
-        0.0, 0.0, initialOdom_.pose.covariance[5], initialOdom_.pose.covariance[0], initialOdom_.pose.covariance[1], 0.0,
-        0.0, 0.0, initialOdom_.pose.covariance[11], initialOdom_.pose.covariance[6], initialOdom_.pose.covariance[7], 0.0,
-        0.0, 0.0, 0.0, 0.0, 0.0, 0.0;
+        if (!added_initialValues_)
+        {
+            initialOdom_ = currentOdom_;
+            prior_noise_model_ = pose_noise_model_;
 
-    Vector3 prior_vel(0.0, 0.0, 0.0); // Prior velocity
-
-    initial_estimates_.insert(X(index_), prior_pose);
-    initial_estimates_.insert(V(index_), prior_vel);
-    initial_estimates_.insert(B(index_), prior_imu_bias_);
-
-    ROS_INFO_STREAM("Initial Values read from Odom!!");
-
-    addInitialValuestoGraph(prior_pose, prior_vel);
-
-    // Unsubscribe from the odometry topic after receiving the first message
-    odom_sub_.shutdown();
+            // ROS_INFO_STREAM("Initial Values read from Odom!!");
+        }
+        // prior_noise_model << initialOdom_.pose.covariance[0], initialOdom_.pose.covariance[1], initialOdom_.pose.covariance[2], initialOdom_.pose.covariance[3], initialOdom_.pose.covariance[4], initialOdom_.pose.covariance[5],
+        //                     initialOdom_.pose.covariance[6], initialOdom_.pose.covariance[7], initialOdom_.pose.covariance[8], initialOdom_.pose.covariance[9], initialOdom_.pose.covariance[10], initialOdom_.pose.covariance[11],
+        //                     initialOdom_.pose.covariance[12], initialOdom_.pose.covariance[13], initialOdom_.pose.covariance[14], initialOdom_.pose.covariance[15],initialOdom_.pose.covariance[16], initialOdom_.pose.covariance[17],
+        //                     initialOdom_.pose.covariance[18], initialOdom_.pose.covariance[19], initialOdom_.pose.covariance[20], initialOdom_.pose.covariance[21], initialOdom_.pose.covariance[22], initialOdom_.pose.covariance[23],
+        //                     initialOdom_.pose.covariance[24], initialOdom_.pose.covariance[25], initialOdom_.pose.covariance[26], initialOdom_.pose.covariance[27],initialOdom_.pose.covariance[28], initialOdom_.pose.covariance[29],
+        //                     initialOdom_.pose.covariance[30], initialOdom_.pose.covariance[31],initialOdom_.pose.covariance[32], initialOdom_.pose.covariance[33], initialOdom_.pose.covariance[34], initialOdom_.pose.covariance[35];
+    }
 }
 
-void graph_vio_handler::addInitialValuestoGraph(const Pose3 &prior_pose, const Vector3 &prior_vel)
+void graph_vio_handler::addInitialValuestoGraph()
 {
-
-    // Add initial noise models (Read Covariance from odom)
-    auto pose_noise_model = noiseModel::Constrained::Covariance(prior_noise_model_); // TODO: Tuning
-
-    auto gaussian_bias = noiseModel::Diagonal::Sigmas((Vector(6) << Vector3::Constant(5.0e-2), Vector3::Constant(5.0e-3)).finished()); // TODO: Tuning
-    auto huber_bias = noiseModel::Robust::Create(noiseModel::mEstimator::Huber::Create(1.345), gaussian_bias);                         // TODO: Tuning
-
-    bias_noise_model_ = huber_bias;
-
-    auto gaussian_vel = noiseModel::Isotropic::Sigma(3, 0.01);                                               // TODO: Tuning
-    auto huber_vel = noiseModel::Robust::Create(noiseModel::mEstimator::Huber::Create(1.345), gaussian_vel); // TODO: Tuning
-
-    velocity_noise_model_ = huber_vel;
-
     // addPrior to the graph
-    graph_->addPrior(X(index_), prior_pose, pose_noise_model);
-    graph_->addPrior(V(index_), prior_vel, velocity_noise_model_);
-    graph_->addPrior(B(index_), prior_imu_bias_, bias_noise_model_);
+    initial_estimates_.insert(X(index_), current_pose_);
+    graph_->addPrior(X(index_), current_pose_, prior_noise_model_);
 
     added_initialValues_ = true;
     ROS_INFO_STREAM("Initial Values added to the graph!!");
-
-    prev_state_ = NavState(prior_pose, prior_vel);
-    prop_state_ = prev_state_;
-    prev_bias_ = prior_imu_bias_;
 }
 
 void graph_vio_handler::readCameraParams()
@@ -375,94 +353,14 @@ void graph_vio_handler::readCameraParams()
     // TODO: Reading camera pose in body (body_P_sensor_)
 }
 
-void graph_vio_handler::getImuParams()
-{
-    double accel_noise_sigma, gyro_noise_sigma, accel_bias_rw_sigma, gyro_bias_rw_sigma;
-
-    // Read IMU parameters from the parameter server
-    if (!nh_.getParam("/graphVIO/IMU/accel_noise_sigma", accel_noise_sigma) ||
-        !nh_.getParam("/graphVIO/IMU/gyro_noise_sigma", gyro_noise_sigma) ||
-        !nh_.getParam("/graphVIO/IMU/accel_bias_rw_sigma", accel_bias_rw_sigma) ||
-        !nh_.getParam("/graphVIO/IMU/gyro_bias_rw_sigma", gyro_bias_rw_sigma))
-    {
-        ROS_ERROR("Failed to read IMU parameters from the parameter server");
-        return;
-    }
-    else
-    {
-
-        p_ = PreintegratedCombinedMeasurements::Params::MakeSharedD();
-        Matrix33 measured_acc_cov = I_3x3 * pow(accel_noise_sigma, 2);
-        Matrix33 measured_omega_cov = I_3x3 * pow(gyro_noise_sigma, 2);
-        Matrix33 integration_error_cov = I_3x3 * 1e-8; // TODO: Tuning
-        Matrix33 bias_acc_cov = I_3x3 * pow(accel_bias_rw_sigma, 2);
-        Matrix33 bias_omega_cov = I_3x3 * pow(gyro_bias_rw_sigma, 2);
-        Matrix66 bias_acc_omega_init = I_6x6 * 1e-5; // TODO: Tuning
-
-        // TODO: Add
-        // iRb // Camera to IMU Rotation
-        // iTb // Camera to IMU Translation
-        // p->body_P_sensor = Pose3(iRb, iTb);
-
-        // p_->n_gravity = Vector3(0.0,0.0,gravity_);
-        p_->accelerometerCovariance = measured_acc_cov;
-        p_->integrationCovariance = integration_error_cov;
-        p_->gyroscopeCovariance = measured_omega_cov;
-        p_->biasAccCovariance = bias_acc_cov;
-        p_->biasOmegaCovariance = bias_omega_cov;
-        p_->biasAccOmegaInt = bias_acc_omega_init;
-    }
-    return;
-}
-
-void graph_vio_handler::initpreintegrated()
-{
-    if (p_ != nullptr)
-    {
-        preintegrated_ = std::make_shared<PreintegratedCombinedMeasurements>(p_, prior_imu_bias_);
-    }
-    else
-    {
-        ROS_ERROR_STREAM("IMU params not obtained, can not create IMUPreintegration!");
-    }
-    assert(preintegrated_);
-}
-
-void graph_vio_handler::imuCB(const sensor_msgs::Imu::ConstPtr &imu_msg)
-{
-
-    if ((!stopIMUPreint_) && (lastIMUStamp_ != ros::Time(0)))
-    {
-        if (p_ != nullptr && graph_ != nullptr && preintegrated_ != nullptr && added_initialValues_)
-        {
-            double dt = ((imu_msg->header.stamp) - lastIMUStamp_).toSec();
-            // preintegrated_->integrateMeasurement(Vector3(imu_msg->linear_acceleration.x, imu_msg->linear_acceleration.y, imu_msg->linear_acceleration.z),
-            //                                      Vector3(imu_msg->angular_velocity.x, imu_msg->angular_velocity.y, imu_msg->angular_velocity.z),
-            //                                      dt);
-            preintegrated_->integrateMeasurement(Vector3(imu_msg->linear_acceleration.x, imu_msg->linear_acceleration.y, 0.0),
-                                                 Vector3(imu_msg->angular_velocity.x, imu_msg->angular_velocity.y, imu_msg->angular_velocity.z),
-                                                 dt); // Subtstracted Gravity
-
-            // ROS_INFO_STREAM("Integrating IMU measurements with dt"<< dt);
-        }
-        else
-        {
-            ROS_ERROR_STREAM("Some information missing!, can not do IMU preintegration!!");
-        }
-        // preintegrated_->print("Measurements:- ");
-    }
-
-    lastIMUStamp_ = imu_msg->header.stamp;
-};
-
 void graph_vio_handler::featureCB(const turtlebot_vio::Keypoint2DArray::ConstPtr &feature_msg)
 {
     if ((feature_msg->keypoints).size() > 0)
     {
-        stopIMUPreint_ = true;
-
-        if (initialSmartFactorsAdded_)
+        // stopOdom_ = true;
+        if (!initialSmartFactorsAdded_ && !added_initialValues_)
         {
+            addInitialValuestoGraph();
 
             for (const auto &feature : feature_msg->keypoints)
             {
@@ -475,13 +373,14 @@ void graph_vio_handler::featureCB(const turtlebot_vio::Keypoint2DArray::ConstPtr
 
                 try
                 {
+                    graph_->add(smartFactors_[classID]);
+
                     // Attempt to add the feature to the SmartProjectionPoseFactor
                     smartFactors_[classID]->add(Point2(feature.x, feature.y), X(index_));
-                    graph_->add(smartFactors_[classID]);
                 }
                 catch (const std::exception &e)
                 {
-                    ROS_ERROR_STREAM("Error adding feature to SmartProjectionPoseFactor: " << e.what());
+                    // ROS_ERROR_STREAM("Error adding feature to SmartProjectionPoseFactor: " << e.what());
                     continue; // Skip the current iteration and move to the next feature
                 }
             }
@@ -493,22 +392,10 @@ void graph_vio_handler::featureCB(const turtlebot_vio::Keypoint2DArray::ConstPtr
             index_++;
             ROS_INFO_STREAM("Current Index: " << index_);
 
-            prop_state_ = preintegrated_->predict(prev_state_, prev_bias_);
+            auto current_pose_noise = noiseModel::Constrained::Covariance(pose_noise_model_);
 
-            initial_estimates_.insert(X(index_), prop_state_.pose());
-            initial_estimates_.insert(V(index_), prop_state_.v());
-            initial_estimates_.insert(B(index_), prev_bias_);
-
-            ROS_INFO_STREAM("POSE3 at index" << index_ << "is" << initial_estimates_.at<Pose3>(X(index_)););
-            ROS_INFO_STREAM("Velocity" << index_ << "is" << initial_estimates_.at<Vector3>(V(index_)););
-            // ROS_INFO_STREAM(initial_estimates_.at<Pose3>(X(index_)););
-
-            auto imu_preint = dynamic_cast<const PreintegratedCombinedMeasurements &>(*preintegrated_);
-            CombinedImuFactor imu_factor(X(index_ - 1), V(index_ - 1), X(index_), V(index_), B(index_ - 1), B(index_), imu_preint);
-
-            graph_->add(imu_factor);
-            imuBias::ConstantBias zero_bias(Vector3(0, 0, 0), Vector3(0, 0, 0)); // TODO: Tuning
-            graph_->add(BetweenFactor<imuBias::ConstantBias>(B(index_ - 1), B(index_), zero_bias, bias_noise_model_));
+            initial_estimates_.insert(X(index_), current_pose_);
+            graph_->addPrior(X(index_), current_pose_, current_pose_noise);
 
             for (const auto &feature : feature_msg->keypoints)
             {
@@ -526,22 +413,17 @@ void graph_vio_handler::featureCB(const turtlebot_vio::Keypoint2DArray::ConstPtr
                 }
                 catch (const std::exception &e)
                 {
-                    ROS_ERROR_STREAM("Error adding feature to SmartProjectionPoseFactor: " << e.what());
+                    // ROS_ERROR_STREAM("Error adding feature to SmartProjectionPoseFactor: " << e.what());
                     continue; // Skip the current iteration and move to the next feature
                 }
             }
             if (index_ > 2)
             {
                 solveAndResetGraph();
+                ROS_INFO_STREAM("Current Pose:  " << results_.at<Pose3>(X(index_)));
+                publishOdom();
             }
-
-            prev_state_ = NavState(results_.at<Pose3>(X(index_)), results_.at<Vector3>(V(index_)));
-
-            prev_bias_ = results_.at<imuBias::ConstantBias>(B(index_));
         }
-
-        preintegrated_->resetIntegrationAndSetBias(prev_bias_);
-        stopIMUPreint_ = false; // TODO: Change position of this trigger after graph update
     }
     else
     {
@@ -585,6 +467,98 @@ void graph_vio_handler::solveAndResetGraph()
         std::string file_name = ros::package::getPath("turtlebot_vio") + "/graph_viz/factorGraphViz.dot";
         ROS_INFO_STREAM("Graph viz file" << file_name);
         graph_->saveGraph(file_name, results_);
+    }
+};
+
+void graph_vio_handler::publishOdom()
+{
+    // Check if the results_ map contains the current pose estimate
+    if (!results_.empty())
+    {
+        // Retrieve the current pose estimate
+        Pose3 current_pose_estimate = results_.at<Pose3>(X(index_));
+
+        // Convert the Pose3 estimate to an Odometry message
+        nav_msgs::Odometry odom;
+        odom.header.stamp = ros::Time::now();
+        odom.header.frame_id = "map";                            // Assuming "odom" is the frame you want to use
+        odom.child_frame_id = "turtlebot/kobuki/base_footprint"; // Assuming "base_link" is the child frame
+
+        // Set the position and orientation from the Pose3 estimate
+        odom.pose.pose.position.x = current_pose_estimate.translation().x();
+        odom.pose.pose.position.y = current_pose_estimate.translation().y();
+        odom.pose.pose.position.z = current_pose_estimate.translation().z();
+
+        Quaternion qt = (current_pose_estimate.rotation()).toQuaternion();
+
+        odom.pose.pose.orientation.y = qt.y();
+        odom.pose.pose.orientation.x = qt.x();
+        odom.pose.pose.orientation.z = qt.z();
+        odom.pose.pose.orientation.w = qt.w();
+
+        // Publish the Odometry message
+        odom_pub_.publish(odom);
+    }
+    else
+    {
+        ROS_WARN("No pose estimate found in results_ for publishing.");
+    }
+}
+
+void graph_vio_handler::publishFeatures(const ros::TimerEvent &)
+{
+    if (!results_.empty())
+    {
+        visualization_msgs::MarkerArray markerArray;
+
+        int markerId = 0;
+        // Iterate over all the smart factor instances stored in the map smartFactors_
+        for (const auto& smartFactorPair : smartFactors_)
+        {
+            // Calculate the 3D point for the smart factor using the pose estimates from the results_ map
+            auto pointEstimate = (smartFactorPair.second)->point(results_);
+            if (pointEstimate)
+            {
+                // Create a geometry_msgs::Point message
+                geometry_msgs::Point pointMsg;
+                pointMsg.x = pointEstimate->x();
+                pointMsg.y = pointEstimate->y();
+                pointMsg.z = pointEstimate->z();
+
+                // Publish the 3D point
+                point_pub_.publish(pointMsg);
+
+                visualization_msgs::Marker marker;
+                marker.header.frame_id = "map";
+                marker.header.stamp = ros::Time::now();
+                marker.ns = "points";
+                marker.id = markerId++;
+                marker.type = visualization_msgs::Marker::SPHERE;
+                marker.action = visualization_msgs::Marker::ADD;
+                marker.pose.position.x = pointEstimate->x();
+                marker.pose.position.y = pointEstimate->y();
+                marker.pose.position.z = pointEstimate->z();
+                marker.pose.orientation.x = 0.0;
+                marker.pose.orientation.y = 0.0;
+                marker.pose.orientation.z = 0.0;
+                marker.pose.orientation.w = 1.0;
+                marker.scale.x = 0.1; // Adjust the scale as needed
+                marker.scale.y = 0.1;
+                marker.scale.z = 0.1;
+                marker.color.a = 1.0; // Alpha
+                marker.color.r = 1.0; // Red
+                marker.color.g = 0.0; // Green
+                marker.color.b = 0.0; // Blue
+
+                markerArray.markers.push_back(marker);
+
+            }
+            else
+            {
+                continue;
+            }
+        }
+        point_marker_pub_.publish(markerArray);
     }
 }
 

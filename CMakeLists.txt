@@ -30,11 +30,18 @@ find_package(catkin REQUIRED COMPONENTS
     image_transport
 )
 
+# find_package(turtlebot_graph_slam REQUIRED)
+# include_directories(${turtlebot_graph_slam_INCLUDE_DIRS})
 ## System dependencies are found with CMake's conventions
 # find_package(PCL REQUIRED)
 
+# Include GTSAM CMake tools
 find_package(GTSAMCMakeTools)
+#include(GtsamBuildTypes) # Load build type flags and default to Debug mode
+#include(GtsamTesting)    # Easy functions for creating unit tests and scripts
+#include(GtsamMatlabWrap) # Automatic MATLAB wrapper generation
 find_package(GTSAM REQUIRED)
+
 find_package(OpenCV 4.9.0 REQUIRED)
 
 find_package(Eigen3 REQUIRED)
@@ -189,7 +196,7 @@ add_executable(graph_vio_node src/graph_vio_node.cpp)
 
 ## Add cmake target dependencies of the executable
 ## same as for the library above
-# add_dependencies(${PROJECT_NAME}_node ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
+# add_dependencies(graph_vio_node ${turtlebot_graph_slam_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
 
 ## Specify libraries to link a library or executable target against
 target_link_libraries(image_processing_node
