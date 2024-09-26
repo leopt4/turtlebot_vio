@@ -1,0 +1,27 @@
+<launch>
+
+    <include file="$(find turtlebot_simulation)/launch/turtlebot_basic.launch">
+        <arg name="robot_name" value="turtlebot"/>
+        <arg name="simulation_data" value="$(find turtlebot_simulation)/resources"/>
+        <arg name="scenario_description" value="$(find turtlebot_vio)/scenarios/turtlebot_poster.scn"/>
+        <arg name="simulation_rate" value="1000.0"/>
+        <arg name="graphics_resolution" value="1200 800"/>
+        <arg name="graphics_quality" value="high"/>
+    </include>
+
+    <rosparam file="$(find turtlebot_vio)/config/params.yaml" command="load"/>
+    
+    <!-- Environment node -->
+    <node pkg="turtlebot_vio" type="turtlebot_teleop_convert_node.py" name="turtlebot_teleop_convert_node"/>
+    <node pkg="turtlebot_vio" type="environment_node.py" name="environment_node"/>
+
+    <!-- EKF node -->
+    <node pkg="turtlebot_vio" type="EKF_node.py" name="EKF_node"/>
+    
+    <!-- Graph VIO node -->
+    <node pkg="turtlebot_vio" type="graph_vio_node" name="graph_vio_node"/>
+
+    <!-- Image Processing Node (Feature Extraction) -->
+    <!-- <node pkg="turtlebot_vio" type="image_processing_node" name="image_processing_node"/> -->
+
+</launch>

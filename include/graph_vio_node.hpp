@@ -481,8 +481,8 @@ void graph_vio_handler::publishOdom()
         // Convert the Pose3 estimate to an Odometry message
         nav_msgs::Odometry odom;
         odom.header.stamp = ros::Time::now();
-        odom.header.frame_id = "map";                            // Assuming "odom" is the frame you want to use
-        odom.child_frame_id = "turtlebot/kobuki/base_footprint"; // Assuming "base_link" is the child frame
+        odom.header.frame_id = "map";                            
+        odom.child_frame_id = "turtlebot/kobuki/base_footprint"; 
 
         // Set the position and orientation from the Pose3 estimate
         odom.pose.pose.position.x = current_pose_estimate.translation().x();
@@ -529,7 +529,7 @@ void graph_vio_handler::publishFeatures(const ros::TimerEvent &)
                 point_pub_.publish(pointMsg);
 
                 visualization_msgs::Marker marker;
-                marker.header.frame_id = "map";
+                marker.header.frame_id = "turtlebot/kobuki/realsense_color";
                 marker.header.stamp = ros::Time::now();
                 marker.ns = "points";
                 marker.id = markerId++;
