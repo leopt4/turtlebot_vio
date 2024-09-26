@@ -58,7 +58,6 @@
   <depend>sensor_msgs</depend>
   <depend>cv_bridge</depend>
   <depend>tf_conversions</depend>
-  <depend>random_numbers</depend>
   <depend>nav_msgs</depend>
   <!-- <depend>pcl_conversions</depend> -->
   <!-- <depend>pcl_ros</depend> -->

@@ -19,7 +19,6 @@ find_package(catkin REQUIRED COMPONENTS
     geometry_msgs
     eigen_conversions
     tf_conversions
-    random_numbers
     message_generation
     # pcl_conversions
     # pcl_ros
